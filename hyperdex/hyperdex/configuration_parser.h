@@ -29,9 +29,9 @@
 #define hyperdex_configuration_parser_h_
 
 // HyperDex
-#include <hyperdex/attribute.h>
-#include <hyperdex/configuration.h>
-#include <hyperdex/datatype.h>
+#include "hyperdex.h"
+#include "hyperdex/hyperdex/attribute.h"
+#include "hyperdex/hyperdex/configuration.h"
 
 namespace hyperdex
 {
@@ -50,11 +50,13 @@ class configuration_parser
             CP_DUPE_ENTITY,
             CP_DUPE_XFER,
             CP_DUPE_VERSION,
+            CP_DUPE_QUIESCE_STATE_ID,
             CP_MISSING_SPACE,
             CP_MISSING_SUBSPACE,
             CP_MISSING_REGION,
             CP_OUTOFORDER_SUBSPACE,
             CP_EXCESS_DATA,
+            CP_ATTR_NOT_SEARCHABLE,
             CP_MISSING,
             CP_F_FAILURES,
             CP_UNKNOWN_ATTR,
@@ -68,6 +70,7 @@ class configuration_parser
             CP_BAD_UINT16,
             CP_BAD_UINT8,
             CP_BAD_ATTR_CHOICE,
+            CP_BAD_TYPE,
             EOE
         };
 
@@ -92,12 +95,16 @@ class configuration_parser
                            char* const eol);
         error parse_transfer(char* start,
                              char* const eol);
+        error parse_quiesce(char* start,
+                            char* const eol);
+        error parse_shutdown(char* start,
+                             char* const eol);
         error extract_bool(char* start,
                            char* end,
                            bool* t);
         error extract_datatype(char* start,
                                char* end,
-                               datatype* t);
+                               hyperdatatype* t);
         error extract_ip(char* start,
                          char* end,
                          po6::net::ipaddr* ip);
@@ -118,6 +125,7 @@ class configuration_parser
                                const std::vector<bool>& attrs);
 
     private:
+        std::string m_config_text;
         uint64_t m_version;
         std::map<uint64_t, instance> m_hosts;
         std::map<std::string, spaceid> m_space_assignment;
@@ -128,6 +136,9 @@ class configuration_parser
         std::set<regionid> m_regions;
         std::map<entityid, instance> m_entities;
         std::map<std::pair<instance, uint16_t>, hyperdex::regionid> m_transfers;
+        bool m_quiesce;
+        std::string m_quiesce_state_id;
+        bool m_shutdown;
 };
 
 } // namespace hyperdex

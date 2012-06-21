@@ -40,6 +40,7 @@
 #include "hyperdisk/hyperdisk/reference.h"
 
 // HyperDex
+#include "hyperdex/hyperdex/microop.h"
 #include "hyperdex/hyperdex/network_constants.h"
 #include "hyperdex/hyperdex/packing.h"
 
@@ -227,28 +228,28 @@ hyperdaemon :: network_worker :: run()
 
             m_repl->client_del(from, to, nonce, msg, key);
         }
-        else if (type == hyperdex::REQ_ATOMICINC)
+        else if (type == hyperdex::REQ_ATOMIC)
         {
-            uint32_t attrs_sz;
+            uint32_t num_microops;
             e::slice key;
-            std::vector<std::pair<uint16_t, e::slice> > attrs;
-            up = up >> nonce >> key >> attrs_sz;
+            std::vector<hyperdex::microop> microops;
+            up = up >> nonce >> key >> num_microops;
+            microops.reserve(num_microops);
 
-            for (uint32_t i = 0; i < attrs_sz; ++i)
+            for (uint32_t i = 0; i < num_microops; ++i)
             {
-                uint16_t dimnum;
-                e::slice val;
-                up = up >> dimnum >> val;
-                attrs.push_back(std::make_pair(dimnum, val));
+                hyperdex::microop o;
+                up = up >> o;
+                microops.push_back(o);
             }
 
             if (up.error())
             {
-                LOG(WARNING) << "unpack of REQ_PUT failed; here's some hex:  " << msg->hex();
+                LOG(WARNING) << "unpack of REQ_ATOMIC failed; here's some hex:  " << msg->hex();
                 continue;
             }
 
-            m_repl->client_atomicinc(from, to, nonce, msg, key, &attrs);
+            m_repl->client_atomic(from, to, nonce, msg, key, &microops);
         }
         else if (type == hyperdex::REQ_SEARCH_START)
         {
@@ -293,6 +294,69 @@ hyperdaemon :: network_worker :: run()
             }
 
             m_ssss->stop(to, from, searchid);
+        }
+        else if (type == hyperdex::REQ_SORTED_SEARCH)
+        {
+            hyperspacehashing::search s(0);
+            uint64_t limit = 0;
+            uint16_t attrno = 0;
+            int8_t max = 0;
+
+            if ((up >> nonce >> s >> limit >> attrno >> max).error())
+            {
+                LOG(WARNING) << "unpack of REQ_SEARCH_STOP failed; here's some hex:  " << msg->hex();
+                continue;
+            }
+
+            if (s.sanity_check())
+            {
+                m_ssss->sorted_search(to, from, nonce, s, limit, attrno, max != 0);
+            }
+            else
+            {
+                LOG(INFO) << "Dropping sorted_search which fails sanity_check.";
+            }
+        }
+        else if (type == hyperdex::REQ_GROUP_DEL)
+        {
+            hyperspacehashing::search s(0);
+
+            if ((up >> nonce >> s).error())
+            {
+                LOG(WARNING) << "unpack of REQ_GROUP_DEL failed; here's some hex:  " << msg->hex();
+                continue;
+            }
+
+            hyperdex::network_msgtype mt(hyperdex::REQ_DEL);
+            e::slice sl;
+
+            if (s.sanity_check())
+            {
+                m_ssss->group_keyop(to, from, nonce, s, mt, sl);
+            }
+            else
+            {
+                LOG(INFO) << "Dropping group_del which fails sanity_check.";
+            }
+        }
+        else if (type == hyperdex::REQ_COUNT)
+        {
+            hyperspacehashing::search s(0);
+
+            if ((up >> nonce >> s).error())
+            {
+                LOG(WARNING) << "unpack of REQ_COUNT failed; here's some hex:  " << msg->hex();
+                continue;
+            }
+
+            if (s.sanity_check())
+            {
+                m_ssss->count(to, from, nonce, s);
+            }
+            else
+            {
+                LOG(INFO) << "Dropping count which fails sanity_check.";
+            }
         }
         else if (type == hyperdex::CHAIN_PUT)
         {
@@ -391,7 +455,7 @@ hyperdaemon :: network_worker :: run()
 
         if (rand_r(&seed) < (0.01 * RAND_MAX))
         {
-            m_data->flush(to.get_region(), 100000);
+            m_data->flush(to.get_region(), 100000, true);
         }
     }
 }

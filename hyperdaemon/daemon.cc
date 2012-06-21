@@ -29,7 +29,12 @@
 #include <signal.h>
 #include <unistd.h>
 
+// C++
+#include <sstream>
+#include <fstream>
+
 // STL
+#include <algorithm>
 #include <tr1/memory>
 
 // Google Log
@@ -43,7 +48,7 @@
 #include "hyperdex/hyperdex/coordinatorlink.h"
 
 // HyperDaemon
-#include "hyperdaemon/hyperdaemon/daemon.h"
+#include "hyperdaemon/daemon.h"
 #include "hyperdaemon/datalayer.h"
 #include "hyperdaemon/logical.h"
 #include "hyperdaemon/network_worker.h"
@@ -51,8 +56,11 @@
 #include "hyperdaemon/replication_manager.h"
 #include "hyperdaemon/searches.h"
 
-// Configuration
+// util
+#include <util/atomicfile.h>
 
+// Configuration
+static const char* DAEMON_TOKEN_FILE = "token.hd";
 typedef std::tr1::shared_ptr<po6::threads::thread> thread_ptr;
 
 static bool s_continue = true;
@@ -113,20 +121,50 @@ hyperdaemon :: daemon(const char* progname,
         return EXIT_FAILURE;
     }
 
-    char random_bytes[16];
-
+    // Token uniquely identifies a daemon. It is generated once on first start and used for the life 
+    // of daemon, even after restart or daemon move. 
+    std::string token;
+    
+    po6::pathname token_file = po6::join(datadir, DAEMON_TOKEN_FILE);
+    std::ifstream f; 
+    f.open(token_file.get());
+    if (f)
     {
+        // Use the existing token.
+        f >> token;
+        if (f.fail() || token.length()!=32)
+        {
+            PLOG(ERROR) << "corrupted token file " << token_file.get() << ", token read " << token;
+            return EXIT_FAILURE;
+        }
+        
+        f.close();
+    }
+    else
+    {
+        // Generate new token.
         po6::io::fd rand(open("/dev/urandom", O_RDONLY));
-
         if (rand.get() < 0)
         {
             PLOG(ERROR) << "could not open /dev/urandom for random bytes (open)";
             return EXIT_FAILURE;
         }
 
+        char random_bytes[16];
         if (rand.read(random_bytes, 16) != 16)
         {
             PLOG(ERROR) << "could not read random bytes from /dev/urandom (read)";
+            return EXIT_FAILURE;
+        }
+    
+        token = e::slice(random_bytes, 16).hex();
+        
+        // Save the token into a file (atomically).
+        std::ostringstream s;
+        s << token << std::endl;
+        if (!util::atomicfile::rewrite(datadir.get(), DAEMON_TOKEN_FILE, s.str().c_str()))
+        {
+            PLOG(ERROR) << "could not write token to file " << token_file.get();
             return EXIT_FAILURE;
         }
     }
@@ -145,7 +183,7 @@ hyperdaemon :: daemon(const char* progname,
                              << comm.inst().inbound_port << "\t"
                              << comm.inst().outbound_port << "\t"
                              << getpid() << "\t"
-                             << e::slice(random_bytes, 16).hex();
+                             << token;
     cl.set_announce(announce.str());
     // Setup the search component.
     searches ssss(&cl, &data, &comm);
@@ -155,15 +193,6 @@ hyperdaemon :: daemon(const char* progname,
     replication_manager repl(&cl, &data, &comm, &ost);
     // Give the ongoing_state_transfers a view into the replication component
     ost.set_replication_manager(&repl);
-
-    LOG(INFO) << "Connecting to the coordinator.";
-
-    while (s_continue && cl.connect() != hyperdex::coordinatorlink::SUCCESS)
-    {
-        PLOG(INFO) << "Coordinator connection failed";
-        e::sleep_ms(1, 0);
-    }
-
     // Start the network workers.
     LOG(INFO) << "Starting network workers.";
     network_worker nw(&data, &comm, &ssss, &ost, &repl);
@@ -178,10 +207,33 @@ hyperdaemon :: daemon(const char* progname,
     }
 
     LOG(INFO) << "Network workers started.";
+    uint64_t now;
     uint64_t disconnected_at = e::time();
+    uint64_t nanos_to_wait = 5000000;
+    // Reconnect right away, then 10ms, then 20ms, .... 1s
 
     while (s_continue)
     {
+        switch (cl.poll(1, -1))
+        {
+            case hyperdex::coordinatorlink::SUCCESS:
+                break;
+            case hyperdex::coordinatorlink::CONNECTFAIL:
+                now = e::time();
+                PLOG(ERROR) << "Coordinator connection failed";
+
+                if (now - disconnected_at < nanos_to_wait)
+                {
+                    e::sleep_ns(0, nanos_to_wait - (now - disconnected_at));
+                }
+
+                disconnected_at = e::time();
+                nanos_to_wait = std::min(nanos_to_wait * 2, static_cast<uint64_t>(1000000000));
+                continue;;
+            default:
+                abort();
+        }
+
         if (cl.unacknowledged())
         {
             LOG(INFO) << "Installing new configuration version " << cl.config().version();
@@ -236,37 +288,6 @@ hyperdaemon :: daemon(const char* progname,
             comm.cleanup(cl.config(), comm.inst());
             cl.acknowledge();
         }
-
-        uint64_t now;
-
-        switch (cl.loop(1, -1))
-        {
-            case hyperdex::coordinatorlink::SHUTDOWN:
-                s_continue = false;
-                break;
-            case hyperdex::coordinatorlink::SUCCESS:
-                break;
-            case hyperdex::coordinatorlink::CONNECTFAIL:
-            case hyperdex::coordinatorlink::DISCONNECT:
-                now = e::time();
-
-                if (now - disconnected_at < 1000000000)
-                {
-                    e::sleep_ns(0, 1000000000 - (now - disconnected_at));
-                }
-
-                if (cl.connect() != hyperdex::coordinatorlink::SUCCESS)
-                {
-                    PLOG(ERROR) << "Coordinator connection failed";
-                    e::sleep_ms(1, 0);
-                }
-
-                disconnected_at = e::time();
-                break;
-            case hyperdex::coordinatorlink::LOGICERROR:
-            default:
-                abort();
-        }
     }
 
     LOG(INFO) << "Exiting daemon.";
@@ -277,8 +298,6 @@ hyperdaemon :: daemon(const char* progname,
     comm.shutdown();
     // Cleanup the network_worker threads.
     nw.shutdown();
-    // Cleanup the master thread.
-    cl.shutdown();
     // Stop the data layer.
     data.shutdown();
 

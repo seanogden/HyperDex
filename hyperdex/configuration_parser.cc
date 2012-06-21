@@ -31,7 +31,8 @@
 #include "hyperdex/hyperdex/configuration_parser.h"
 
 hyperdex :: configuration_parser :: configuration_parser()
-    : m_version(0)
+    : m_config_text("")
+    , m_version(0)
     , m_hosts()
     , m_space_assignment()
     , m_spaces()
@@ -41,6 +42,9 @@ hyperdex :: configuration_parser :: configuration_parser()
     , m_regions()
     , m_entities()
     , m_transfers()
+    , m_quiesce(false)
+    , m_quiesce_state_id("")
+    , m_shutdown(false)
 {
 }
 
@@ -85,8 +89,9 @@ hyperdex :: configuration_parser :: generate()
         disk_hashers.insert(std::make_pair(di->first, h));
     }
 
-    return configuration(m_version, hosts, m_space_assignment, m_spaces, space_sizes,
-                         m_entities, repl_hashers, disk_hashers, m_transfers);
+    return configuration(m_config_text, m_version, hosts, m_space_assignment, m_spaces, space_sizes,
+                         m_entities, repl_hashers, disk_hashers, m_transfers,
+                         m_quiesce, m_quiesce_state_id, m_shutdown);
 }
 
 #define _CONCAT(x,y) x ## y
@@ -104,6 +109,7 @@ hyperdex::configuration_parser::error
 hyperdex :: configuration_parser :: parse(const std::string& config)
 {
     *this = configuration_parser();
+    m_config_text = config;
     std::vector<char> v;
     v.resize(config.size() + 1);
     memmove(&v.front(), config.c_str(), config.size() + 1);
@@ -135,6 +141,15 @@ hyperdex :: configuration_parser :: parse(const std::string& config)
         else if (strncmp("transfer ", start, 9) == 0)
         {
             ABORT_ON_ERROR(parse_transfer(start, eol));
+        }
+        else if (strncmp("quiesce ", start, 8) == 0)
+        {
+            ABORT_ON_ERROR(parse_quiesce(start, eol));
+        }
+        // shutdown has no space after (no args)
+        else if (strncmp("shutdown", start, 8) == 0)
+        {
+            ABORT_ON_ERROR(parse_shutdown(start, eol));
         }
         else
         {
@@ -296,7 +311,7 @@ hyperdex :: configuration_parser :: parse_space(char* start,
 
     while (start < eol)
     {
-        datatype t;
+        hyperdatatype t;
 
         SKIP_WHITESPACE(start, eol);
         end = start;
@@ -405,6 +420,35 @@ hyperdex :: configuration_parser :: parse_subspace(char* start,
         if (subspace == 0 && i == 0 && !repl)
         {
             return CP_BAD_ATTR_CHOICE;
+        }
+
+        if (repl || disk)
+        {
+            switch (si->second[i].type)
+            {
+                // Searchable types
+                case HYPERDATATYPE_STRING:
+                case HYPERDATATYPE_INT64:
+                    break;
+                // Types which we cannot hash for searching
+                case HYPERDATATYPE_LIST_STRING:
+                case HYPERDATATYPE_LIST_INT64:
+                case HYPERDATATYPE_SET_STRING:
+                case HYPERDATATYPE_SET_INT64:
+                case HYPERDATATYPE_MAP_STRING_STRING:
+                case HYPERDATATYPE_MAP_STRING_INT64:
+                case HYPERDATATYPE_MAP_INT64_STRING:
+                case HYPERDATATYPE_MAP_INT64_INT64:
+                    return CP_ATTR_NOT_SEARCHABLE;
+                case HYPERDATATYPE_LIST_GENERIC:
+                case HYPERDATATYPE_SET_GENERIC:
+                case HYPERDATATYPE_MAP_GENERIC:
+                case HYPERDATATYPE_MAP_STRING_KEYONLY:
+                case HYPERDATATYPE_MAP_INT64_KEYONLY:
+                case HYPERDATATYPE_GARBAGE:
+                default:
+                    abort();
+            }
         }
 
         repl_attrs[i] = repl;
@@ -643,6 +687,60 @@ hyperdex :: configuration_parser :: parse_transfer(char* start,
     return CP_SUCCESS;
 }
 
+hyperdex::configuration_parser::error 
+hyperdex :: configuration_parser :: parse_quiesce(char* start,
+                                                  char* const eol)
+{
+    char* end;
+    std::string quiesce_state_id;
+
+    // Skip "quiesce "
+    start += 8;
+
+    // Pull out the quiesce state id
+    SKIP_WHITESPACE(start, eol);
+    end = start;
+    SKIP_TO_WHITESPACE(end, eol);
+    *end = '\0';
+    quiesce_state_id = std::string(start, end);
+    start = end + 1;
+
+    if (end != eol)
+    {
+        return CP_EXCESS_DATA;
+    }
+
+    if (m_quiesce_state_id != "" && m_quiesce_state_id != quiesce_state_id)
+    {
+        return CP_DUPE_QUIESCE_STATE_ID;
+    }
+
+    m_quiesce = true;
+    m_quiesce_state_id = quiesce_state_id;
+    return CP_SUCCESS;
+}
+
+hyperdex::configuration_parser::error 
+hyperdex :: configuration_parser :: parse_shutdown(char* start,
+                                                   char* const eol)
+{
+    char* end;
+
+    // Skip "shutdown" (no args = no following space)
+    start += 8;
+    
+    // No args
+    end = start;
+
+    if (end != eol)
+    {
+        return CP_EXCESS_DATA;
+    }
+
+    m_shutdown = true;
+    return CP_SUCCESS;
+}
+
 hyperdex::configuration_parser::error
 hyperdex :: configuration_parser :: extract_bool(char* start,
                                                  char* end,
@@ -675,7 +773,7 @@ hyperdex :: configuration_parser :: extract_bool(char* start,
 hyperdex::configuration_parser::error
 hyperdex :: configuration_parser :: extract_datatype(char* start,
                                                      char* end,
-                                                     datatype* t)
+                                                     hyperdatatype* t)
 {
     assert(start <= end);
     assert(*end == '\0');
@@ -687,17 +785,57 @@ hyperdex :: configuration_parser :: extract_datatype(char* start,
 
     if (strcmp(start, "string") == 0)
     {
-        *t = DATATYPE_STRING;
+        *t = HYPERDATATYPE_STRING;
         return CP_SUCCESS;
     }
     else if (strcmp(start, "int64") == 0)
     {
-        *t = DATATYPE_INT64;
+        *t = HYPERDATATYPE_INT64;
+        return CP_SUCCESS;
+    }
+    else if (strcmp(start, "list(string)") == 0)
+    {
+        *t = HYPERDATATYPE_LIST_STRING;
+        return CP_SUCCESS;
+    }
+    else if (strcmp(start, "list(int64)") == 0)
+    {
+        *t = HYPERDATATYPE_LIST_INT64;
+        return CP_SUCCESS;
+    }
+    else if (strcmp(start, "set(string)") == 0)
+    {
+        *t = HYPERDATATYPE_SET_STRING;
+        return CP_SUCCESS;
+    }
+    else if (strcmp(start, "set(int64)") == 0)
+    {
+        *t = HYPERDATATYPE_SET_INT64;
+        return CP_SUCCESS;
+    }
+    else if (strcmp(start, "map(string,string)") == 0)
+    {
+        *t = HYPERDATATYPE_MAP_STRING_STRING;
+        return CP_SUCCESS;
+    }
+    else if (strcmp(start, "map(string,int64)") == 0)
+    {
+        *t = HYPERDATATYPE_MAP_STRING_INT64;
+        return CP_SUCCESS;
+    }
+    else if (strcmp(start, "map(int64,string)") == 0)
+    {
+        *t = HYPERDATATYPE_MAP_INT64_STRING;
+        return CP_SUCCESS;
+    }
+    else if (strcmp(start, "map(int64,int64)") == 0)
+    {
+        *t = HYPERDATATYPE_MAP_INT64_INT64;
         return CP_SUCCESS;
     }
     else
     {
-        return CP_BAD_BOOL;
+        return CP_BAD_TYPE;
     }
 }
 
@@ -839,12 +977,26 @@ hyperdex :: configuration_parser :: attrs_to_hashfuncs(const subspaceid& ssi,
         {
             switch (si->second[i].type)
             {
-                case DATATYPE_STRING:
+                case HYPERDATATYPE_STRING:
                     hfuncs.push_back(hyperspacehashing::EQUALITY);
                     break;
-                case DATATYPE_INT64:
+                case HYPERDATATYPE_INT64:
                     hfuncs.push_back(hyperspacehashing::RANGE);
                     break;
+                case HYPERDATATYPE_LIST_GENERIC:
+                case HYPERDATATYPE_LIST_STRING:
+                case HYPERDATATYPE_LIST_INT64:
+                case HYPERDATATYPE_SET_GENERIC:
+                case HYPERDATATYPE_SET_STRING:
+                case HYPERDATATYPE_SET_INT64:
+                case HYPERDATATYPE_MAP_GENERIC:
+                case HYPERDATATYPE_MAP_STRING_KEYONLY:
+                case HYPERDATATYPE_MAP_STRING_STRING:
+                case HYPERDATATYPE_MAP_STRING_INT64:
+                case HYPERDATATYPE_MAP_INT64_KEYONLY:
+                case HYPERDATATYPE_MAP_INT64_STRING:
+                case HYPERDATATYPE_MAP_INT64_INT64:
+                case HYPERDATATYPE_GARBAGE:
                 default:
                     abort();
             }

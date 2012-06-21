@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, Cornell University
+/* Copyright (c) 2011-2012, Cornell University
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -36,6 +36,9 @@
 /* POSIX */
 #include <netinet/in.h>
 
+/* HyperDex */
+#include <hyperdex.h>
+
 #ifdef __cplusplus
 // C++
 #include <iostream>
@@ -44,11 +47,11 @@
 #include <map>
 #include <memory>
 #include <queue>
-#include <stack>
 #include <vector>
 
 // po6
 #include <po6/io/fd.h>
+#include <po6/net/location.h>
 
 // e
 #include <e/buffer.h>
@@ -56,10 +59,21 @@
 #include <e/lockfree_hash_map.h>
 
 // Forward declarations
+namespace e
+{
+class bitfield;
+} // namespace e
+class busybee_st;
+namespace hyperspacehashing
+{
+class search;
+} // namespace hyperspacehashing
 namespace hyperdex
 {
+class attribute;
 class configuration;
 class coordinatorlink;
+class entityid;
 class instance;
 } // namespace hyperdex
 
@@ -69,22 +83,22 @@ extern "C"
 
 struct hyperclient;
 
-/* HyperClient datatype occupies [8960, 9088) */
-enum hyperclient_datatype
-{
-    HYPERDATATYPE_STRING    = 8960,
-    HYPERDATATYPE_INT64     = 8961,
-
-    // Returned if the server acts up
-    HYPERDATATYPE_GARBAGE   = 9087
-};
-
 struct hyperclient_attribute
 {
     const char* attr; /* NULL-terminated */
     const char* value;
     size_t value_sz;
-    enum hyperclient_datatype datatype;
+    enum hyperdatatype datatype;
+};
+
+struct hyperclient_map_attribute
+{
+    const char* attr; /* NULL-terminated */
+    const char* map_key;
+    size_t map_key_sz;
+    const char* value;
+    size_t value_sz;
+    enum hyperdatatype datatype;
 };
 
 struct hyperclient_range_query
@@ -101,22 +115,22 @@ enum hyperclient_returncode
     HYPERCLIENT_NOTFOUND     = 8449,
     HYPERCLIENT_SEARCHDONE   = 8450,
     HYPERCLIENT_CMPFAIL      = 8451,
+    HYPERCLIENT_READONLY     = 8452,
 
     /* Error conditions */
     HYPERCLIENT_UNKNOWNSPACE = 8512,
     HYPERCLIENT_COORDFAIL    = 8513,
     HYPERCLIENT_SERVERERROR  = 8514,
-    HYPERCLIENT_CONNECTFAIL  = 8515,
-    HYPERCLIENT_DISCONNECT   = 8516,
+    HYPERCLIENT_POLLFAILED   = 8515,
+    HYPERCLIENT_OVERFLOW     = 8516,
     HYPERCLIENT_RECONFIGURE  = 8517,
-    HYPERCLIENT_LOGICERROR   = 8518,
     HYPERCLIENT_TIMEOUT      = 8519,
     HYPERCLIENT_UNKNOWNATTR  = 8520,
     HYPERCLIENT_DUPEATTR     = 8521,
-    HYPERCLIENT_SEEERRNO     = 8522,
     HYPERCLIENT_NONEPENDING  = 8523,
     HYPERCLIENT_DONTUSEKEY   = 8524,
     HYPERCLIENT_WRONGTYPE    = 8525,
+    HYPERCLIENT_NOMEM        = 8526,
 
     /* This should never happen.  It indicates a bug */
     HYPERCLIENT_EXCEPTION    = 8574,
@@ -189,7 +203,7 @@ hyperclient_put(struct hyperclient* client, const char* space, const char* key,
  *
  * All attribute values not specified by the conditional put are left as-is.
  *
- * - space, key, condattrs, attrs must point to memory that exists for the 
+ * - space, key, condattrs, attrs must point to memory that exists for the
  *   duration of this call
  * - client, status must point to memory that exists until the request is
  *   considered complete
@@ -210,27 +224,369 @@ int64_t
 hyperclient_del(struct hyperclient* client, const char* space, const char* key,
                 size_t key_sz, enum hyperclient_returncode* status);
 
-/* Atomically increment the fields specified by the values given
+/* Atomically add the values given to the existing attribute values
  *
  * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
  * abs(returned value) - 1 == the attribute which caused the error in attrs.
  *
  * If no object exists under this key, the operation will fail.
- * 
+ *
  * The specified attributes need to be numeric fields.
  *
  * All attribute values not specified by the operation are left as-is.
  *
- * - space, key, attrs must point to memory that exists for the 
+ * - space, key, attrs must point to memory that exists for the
  *   duration of this call
  * - client, status must point to memory that exists until the request is
  *   considered complete
  */
 int64_t
-hyperclient_atomicinc(struct hyperclient* client, const char* space, const char* key,
-		      size_t key_sz, const struct hyperclient_attribute* attrs,
-		      size_t attrs_sz, enum hyperclient_returncode* status);
+hyperclient_atomic_add(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
 
+/* Atomically subtract the values given from the existing attribute values
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be numeric fields.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_atomic_sub(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+/* Atomically multiply the existing attribute values by the values given
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be numeric fields.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_atomic_mul(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+/* Atomically divide the existing attribute values by the values given
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be numeric fields.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_atomic_div(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+/* Atomically take the modulus of the existing attribute values by the values given
+ *
+ * This uses C-style modulus for negative numbers.
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be numeric fields.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_atomic_mod(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+/* Atomically and the existing attribute values with the values given
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be numeric fields.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_atomic_and(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+/* Atomically or the existing attribute values with the values given
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be numeric fields.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_atomic_or(struct hyperclient* client, const char* space,
+                      const char* key, size_t key_sz,
+                      const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                      enum hyperclient_returncode* status);
+
+/* Atomically xor the existing attribute values with the values given
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be numeric fields.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_atomic_xor(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+/* Atomically prepend the values given to the existing attribute values
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be string fields.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_string_prepend(struct hyperclient* client, const char* space,
+                           const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+
+/* Atomically append the values given to the existing attribute values
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be string fields.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_string_append(struct hyperclient* client, const char* space,
+                          const char* key, size_t key_sz,
+                          const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                          enum hyperclient_returncode* status);
+
+/* Atomically push the values given to the head existing attribute lists
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be string fields.  Each will be pushed to
+ * the list in the order specified.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_list_lpush(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+/* Atomically push the values given to the tail existing attribute lists
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error in attrs.
+ *
+ * If no object exists under this key, the operation will fail.
+ *
+ * The specified attributes need to be string fields.  Each will be pushed to
+ * the list in the order specified.
+ *
+ * All attribute values not specified by the operation are left as-is.
+ *
+ * - space, key, attrs must point to memory that exists for the
+ *   duration of this call
+ * - client, status must point to memory that exists until the request is
+ *   considered complete
+ */
+int64_t
+hyperclient_list_rpush(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_set_add(struct hyperclient* client, const char* space,
+                    const char* key, size_t key_sz,
+                    const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                    enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_set_remove(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_set_intersect(struct hyperclient* client, const char* space,
+                          const char* key, size_t key_sz,
+                          const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                          enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_set_union(struct hyperclient* client, const char* space,
+                      const char* key, size_t key_sz,
+                      const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                      enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_add(struct hyperclient* client, const char* space,
+                    const char* key, size_t key_sz,
+                    const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                    enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_remove(struct hyperclient* client, const char* space,
+                       const char* key, size_t key_sz,
+                       const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                       enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_atomic_add(struct hyperclient* client, const char* space,
+                           const char* key, size_t key_sz,
+                           const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_atomic_sub(struct hyperclient* client, const char* space,
+                           const char* key, size_t key_sz,
+                           const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_atomic_mul(struct hyperclient* client, const char* space,
+                           const char* key, size_t key_sz,
+                           const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_atomic_div(struct hyperclient* client, const char* space,
+                           const char* key, size_t key_sz,
+                           const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_atomic_mod(struct hyperclient* client, const char* space,
+                           const char* key, size_t key_sz,
+                           const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_atomic_and(struct hyperclient* client, const char* space,
+                           const char* key, size_t key_sz,
+                           const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_atomic_or(struct hyperclient* client, const char* space,
+                          const char* key, size_t key_sz,
+                          const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                          enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_atomic_xor(struct hyperclient* client, const char* space,
+                           const char* key, size_t key_sz,
+                           const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_string_prepend(struct hyperclient* client, const char* space,
+                               const char* key, size_t key_sz,
+                               const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                               enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_map_string_append(struct hyperclient* client, const char* space,
+                              const char* key, size_t key_sz,
+                              const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                              enum hyperclient_returncode* status);
 
 /* Perform a search for objects which match "eq" and "rn".
  *
@@ -253,6 +609,53 @@ hyperclient_search(struct hyperclient* client, const char* space,
                    const struct hyperclient_range_query* rn, size_t rn_sz,
                    enum hyperclient_returncode* status,
                    struct hyperclient_attribute** attrs, size_t* attrs_sz);
+
+/* Perform a search for objects which match "eq" and "rn", sorting the results
+ * and limiting the number of objects returned.
+ *
+ * Each time hyperclient_loop returns the identifier generated by a call to
+ * hyperclient_search the memory pointed to by status, attrs, and attrs_sz will
+ * be overwritten.  When hyperclient_loop returns and the status is
+ * HYPERCLIENT_SEARCHDONE, the search is completely finished.
+ *
+ * If this returns a value < 0 and *status == HYPERCLIENT_UNKNOWNATTR, then
+ * abs(returned value) - 1 == the attribute which caused the error.  If the
+ * attr's index >= eq_sz, it is an index into rn.  If the attr's index == eq_sz
+ * + rn_sz, the sort_by attribute caused the error.
+ *
+ * If an error is encountered early in the search such that no hosts have been
+ * contacted for the search, -1 will be returned, and *status will be set to the
+ * error.
+ */
+int64_t
+hyperclient_sorted_search(struct hyperclient* client, const char* space,
+                          const struct hyperclient_attribute* eq, size_t eq_sz,
+                          const struct hyperclient_range_query* rn, size_t rn_sz,
+                          const char* sort_by, uint64_t limit, int maximize,
+                          enum hyperclient_returncode* status,
+                          struct hyperclient_attribute** attrs, size_t* attrs_sz);
+
+/* Delete objects which mach "eq" and "rn".
+ *
+ * The remote servers will perform a search as if this were a call to
+ * ``hyperclient_search``, but instead of returning the search results, it will
+ * issue a ``del`` operation.  Once all searches complete, the call will return
+ * to the client.
+ *
+ * This is a best effort call.  It may miss objects that are updated
+ * concurrently with the search and it will not tolerate failures.
+ */
+int64_t
+hyperclient_group_del(struct hyperclient* client, const char* space,
+                      const struct hyperclient_attribute* eq, size_t eq_sz,
+                      const struct hyperclient_range_query* rn, size_t rn_sz,
+                      enum hyperclient_returncode* status);
+
+int64_t
+hyperclient_count(struct hyperclient* client, const char* space,
+                  const struct hyperclient_attribute* eq, size_t eq_sz,
+                  const struct hyperclient_range_query* rn, size_t rn_sz,
+                  enum hyperclient_returncode* status, uint64_t* result);
 
 /* Handle I/O until at least one event is complete (either a key-op finishes, or
  * a search returns one item).
@@ -304,33 +707,142 @@ class hyperclient
 			hyperclient_returncode* status);
         int64_t del(const char* space, const char* key, size_t key_sz,
                     hyperclient_returncode* status);
-        int64_t atomicinc(const char* space, const char* key, size_t key_sz,
-			  const struct hyperclient_attribute* attrs, size_t attrs_sz,
-			  hyperclient_returncode* status);
+        int64_t atomic_add(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t atomic_sub(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t atomic_mul(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t atomic_div(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t atomic_mod(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t atomic_and(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t atomic_or(const char* space, const char* key, size_t key_sz,
+                          const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                          enum hyperclient_returncode* status);
+        int64_t atomic_xor(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t string_prepend(const char* space, const char* key, size_t key_sz,
+                               const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                               enum hyperclient_returncode* status);
+        int64_t string_append(const char* space, const char* key, size_t key_sz,
+                              const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                              enum hyperclient_returncode* status);
+        int64_t list_lpush(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t list_rpush(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t set_add(const char* space, const char* key, size_t key_sz,
+                        const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                        enum hyperclient_returncode* status);
+        int64_t set_remove(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t set_intersect(const char* space, const char* key, size_t key_sz,
+                              const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                              enum hyperclient_returncode* status);
+        int64_t set_union(const char* space, const char* key, size_t key_sz,
+                          const struct hyperclient_attribute* attrs, size_t attrs_sz,
+                          enum hyperclient_returncode* status);
+        int64_t map_add(const char* space, const char* key, size_t key_sz,
+                        const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                        enum hyperclient_returncode* status);
+        int64_t map_remove(const char* space, const char* key, size_t key_sz,
+                           const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                           enum hyperclient_returncode* status);
+        int64_t map_atomic_add(const char* space, const char* key, size_t key_sz,
+                               const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                               enum hyperclient_returncode* status);
+        int64_t map_atomic_sub(const char* space, const char* key, size_t key_sz,
+                               const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                               enum hyperclient_returncode* status);
+        int64_t map_atomic_mul(const char* space, const char* key, size_t key_sz,
+                               const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                               enum hyperclient_returncode* status);
+        int64_t map_atomic_div(const char* space, const char* key, size_t key_sz,
+                               const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                               enum hyperclient_returncode* status);
+        int64_t map_atomic_mod(const char* space, const char* key, size_t key_sz,
+                               const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                               enum hyperclient_returncode* status);
+        int64_t map_atomic_and(const char* space, const char* key, size_t key_sz,
+                               const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                               enum hyperclient_returncode* status);
+        int64_t map_atomic_or(const char* space, const char* key, size_t key_sz,
+                              const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                              enum hyperclient_returncode* status);
+        int64_t map_atomic_xor(const char* space, const char* key, size_t key_sz,
+                               const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                               enum hyperclient_returncode* status);
+        int64_t map_string_prepend(const char* space, const char* key, size_t key_sz,
+                                   const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                                   enum hyperclient_returncode* status);
+        int64_t map_string_append(const char* space, const char* key, size_t key_sz,
+                                  const struct hyperclient_map_attribute* attrs, size_t attrs_sz,
+                                  enum hyperclient_returncode* status);
         int64_t search(const char* space,
                        const struct hyperclient_attribute* eq, size_t eq_sz,
                        const struct hyperclient_range_query* rn, size_t rn_sz,
                        enum hyperclient_returncode* status,
                        struct hyperclient_attribute** attrs, size_t* attrs_sz);
+        int64_t sorted_search(const char* space,
+                              const struct hyperclient_attribute* eq, size_t eq_sz,
+                              const struct hyperclient_range_query* rn, size_t rn_sz,
+                              const char* sort_by,
+                              uint64_t limit,
+                              bool maximize,
+                              enum hyperclient_returncode* status,
+                              struct hyperclient_attribute** attrs, size_t* attrs_sz);
+        int64_t group_del(const char* space,
+                          const struct hyperclient_attribute* eq, size_t eq_sz,
+                          const struct hyperclient_range_query* rn, size_t rn_sz,
+                          enum hyperclient_returncode* status);
+        int64_t count(const char* space,
+                      const struct hyperclient_attribute* eq, size_t eq_sz,
+                      const struct hyperclient_range_query* rn, size_t rn_sz,
+                      enum hyperclient_returncode* status, uint64_t* result);
         int64_t loop(int timeout, hyperclient_returncode* status);
 
     private:
-        class channel;
         class completedop;
         class pending;
+        class pending_count;
         class pending_get;
-        class pending_statusonly;
+        class pending_group_del;
         class pending_search;
-        static uint64_t id(const int64_t& in) { return static_cast<uint64_t>(in); }
-        typedef std::map<hyperdex::instance, e::intrusive_ptr<channel> > instances_map_t;
-        typedef std::map<std::pair<int, uint64_t>, e::intrusive_ptr<pending> > requests_map_t;
+        class pending_sorted_search;
+        class pending_statusonly;
+        typedef std::map<int64_t, e::intrusive_ptr<pending> > incomplete_map_t;
 
     private:
+        int64_t maintain_coord_connection(hyperclient_returncode* status);
         int64_t add_keyop(const char* space,
                           const char* key,
                           size_t key_sz,
                           std::auto_ptr<e::buffer> msg,
                           e::intrusive_ptr<pending> op);
+        int64_t prepare_searchop(const char* space,
+                                 const struct hyperclient_attribute* eq, size_t eq_sz,
+                                 const struct hyperclient_range_query* rn, size_t rn_sz,
+                                 const char* attr, /* optional */
+                                 hyperclient_returncode* status,
+                                 hyperspacehashing::search* s,
+                                 std::map<hyperdex::entityid, hyperdex::instance>* search_entities,
+                                 uint16_t* attrno,
+                                 hyperdatatype* attrtype);
+        int64_t send(e::intrusive_ptr<pending> op,
+                     std::auto_ptr<e::buffer> msg);
         int64_t pack_attrs(const char* space,
                            e::buffer::packer* p,
                            const struct hyperclient_attribute* attrs,
@@ -338,24 +850,36 @@ class hyperclient
                            hyperclient_returncode* status);
         size_t pack_attrs_sz(const struct hyperclient_attribute* attrs,
                              size_t attrs_sz);
-        int64_t send(e::intrusive_ptr<channel> chan,
-                     e::intrusive_ptr<pending> op,
-                     e::buffer* msg);
-        int64_t maintain_coord_connection(hyperclient_returncode* status);
-        void killall(int fd, hyperclient_returncode status);
-        e::intrusive_ptr<channel> get_channel(hyperdex::instance inst,
-                                              hyperclient_returncode* status);
-        e::intrusive_ptr<channel> channel_from_fd(int fd);
+        void killall(const po6::net::location& loc, hyperclient_returncode status);
+        int64_t attributes_to_microops(hyperdatatype (*coerce_datatype)(hyperdatatype e, hyperdatatype p),
+                                       int action, const char* space,
+                                       const char* key, size_t key_sz,
+                                       const struct hyperclient_attribute* attrs,
+                                       size_t attrs_sz,
+                                       hyperclient_returncode* status);
+        int64_t map_attributes_to_microops(hyperdatatype (*coerce_datatype)(hyperdatatype e, hyperdatatype p),
+                                           int action, const char* space,
+                                           const char* key, size_t key_sz,
+                                           const struct hyperclient_map_attribute* attrs,
+                                           size_t attrs_sz,
+                                           hyperclient_returncode* status);
+        int validate_attr(hyperdatatype (*coerce_datatype)(hyperdatatype e, hyperdatatype p),
+                          const std::vector<hyperdex::attribute>& dimensions,
+                          e::bitfield* dimensions_seen,
+                          const char* attr,
+                          hyperdatatype* type,
+                          hyperclient_returncode* status);
 
     private:
         const std::auto_ptr<hyperdex::coordinatorlink> m_coord;
         const std::auto_ptr<hyperdex::configuration> m_config;
-        po6::io::fd m_epfd;
-        std::vector<e::intrusive_ptr<channel> > m_fds;
-        instances_map_t m_instances;
-        requests_map_t m_requests;
-        std::queue<completedop> m_completed;
-        int64_t m_requestid;
+        const std::auto_ptr<busybee_st> m_busybee;
+        incomplete_map_t m_incomplete;
+        std::queue<int64_t> m_complete_succeeded;
+        std::queue<completedop> m_complete_failed;
+        int64_t m_server_nonce;
+        int64_t m_client_id;
+        int m_old_coord_fd;
         bool m_have_seen_config;
 };
 

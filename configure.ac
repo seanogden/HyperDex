@@ -2,9 +2,9 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.66])
-AC_INIT([HyperDex], [0.1.dev], [escriva@cs.cornell.edu])
+AC_INIT([HyperDex], [0.5.dev], [escriva@cs.cornell.edu])
 AM_INIT_AUTOMAKE([foreign subdir-objects dist-bzip2 dist-lzma])
-AM_SILENT_RULES([yes])
+m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 AM_PATH_PYTHON([2.6])
 LT_PREREQ([2.2])
 LT_INIT
@@ -16,6 +16,8 @@ AC_CONFIG_MACRO_DIR([m4])
 AC_PROG_CXX
 AC_PROG_CC
 AC_LANG(C++)
+
+ANAL_WARNINGS_CXX
 
 AC_ARG_ENABLE([java-bindings], [AS_HELP_STRING([--enable-java-bindings],
               [enable the Java bindings @<:@default: no@:>@])],
@@ -78,8 +80,9 @@ AC_CHECK_LIB([popt], [poptGetContext], [], [AC_MSG_ERROR([
 HyperDex relies upon the popt library.
 Please install popt to continue.
 -------------------------------------------------])])
-PKG_CHECK_MODULES([PO6], [libpo6 >= 0.2])
-PKG_CHECK_MODULES([E], [libe >= 0.2])
+PKG_CHECK_MODULES([PO6], [libpo6 >= 0.2.3])
+PKG_CHECK_MODULES([E], [libe >= 0.2.7])
+PKG_CHECK_MODULES([BUSYBEE], [busybee >= 0.1.0])
 
 # Checks for header files.
 AC_CHECK_HEADERS([netinet/in.h stdint.h stdlib.h sys/socket.h unistd.h])

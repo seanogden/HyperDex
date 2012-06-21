@@ -45,7 +45,7 @@
 #include <e/guard.h>
 
 // HyperDex
-#include "hyperdaemon/hyperdaemon/daemon.h"
+#include "hyperdaemon/daemon.h"
 
 static const char* data = ".";
 static const char* host = "127.0.0.1";
@@ -96,10 +96,10 @@ static struct poptOption popts[] = {
 } // extern "C"
 
 int
-main(int argc, char* argv[])
+main(int argc, const char* argv[])
 {
     poptContext poptcon;
-    poptcon = poptGetContext(NULL, argc, (const char**) argv, popts, POPT_CONTEXT_POSIXMEHARDER);
+    poptcon = poptGetContext(NULL, argc, argv, popts, POPT_CONTEXT_POSIXMEHARDER);
     e::guard g = e::makeguard(poptFreeContext, poptcon);
     g.use_variable();
     int rc;

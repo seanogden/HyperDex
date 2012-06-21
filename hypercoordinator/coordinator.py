@@ -31,16 +31,21 @@ import collections
 import datetime
 import logging
 import random
+import binascii
 import select
 import shlex
+import json
+import copy
 import socket
 import sys
+import os
 
 import pyparsing
 
 import hypercoordinator.parser
 from hypercoordinator import hdtypes
 
+import hdjson
 
 PIPE_BUF = getattr(select, 'PIPE_BUF', 512)
 RESTRICTED_SPACES = set([0, 2**32 - 1, 2**32 - 2, 2**32 - 3, 2**32 - 4])
@@ -51,6 +56,9 @@ SUBSPACE_LINE = 'subspace {space} {subspace} {hashes}\n'
 REGION_LINE = 'region {space} {subspace} {prefix} {mask} {hosts}\n'
 TRANSFER_LINE = 'transfer {xferid} {space} {subspace} {prefix} {mask} {instid}\n'
 HOST_LINE = 'host {id} {ip} {inport} {inver} {outport} {outver}'
+QUIESCE_LINE = 'quiesce {state_id}\n'
+SHUTDOWN_LINE = 'shutdown\n'
+
 
 def normalize_address(addr):
     try:
@@ -74,11 +82,18 @@ class Coordinator(object):
     class UnknownSpace(Exception): pass
     class ExhaustedPorts(Exception): pass
     class ExhaustedSpaces(Exception): pass
+    class InvalidStateData(Exception): pass
+    class InvalidState(Exception): pass
+    class ServiceLevelNotMet(Exception): pass
 
-    def __init__(self):
+    S_STARTUP, S_NORMAL, S_QUIESCE, S_SHUTDOWN = 'STARTUP', 'NORMAL', 'QUIESCE', 'SHUTDOWN'
+    SL_DESIRED, SL_DEGRADED, SL_DATALOSS = 'DESIRED', 'DEGRADED', 'DATALOSS'
+    STATE_VERSION = 3
+
+    def __init__(self, state_data=None):
         self._portcounters = collections.defaultdict(lambda: 1)
         self._instance_counter = 1
-        self._instances_by_addr = {}
+        self._instances_by_token = {}
         self._instances_by_bindings = {}
         self._instances_by_id = {}
         self._failed_instances = set()
@@ -90,6 +105,20 @@ class Coordinator(object):
         self._config_data = ''
         self._xfer_counter = 0
         self._xfers_by_id = {}
+        self._quiesce_state_id = ''
+        self._quiesce_config_num = -1
+        self._quiesced_instances = set()
+        self._state = Coordinator.S_STARTUP
+        if state_data:
+            # loading saved coord. state (restart after shutdown)
+            self._load_state(state_data)
+            self._quiesce_state_id = ''
+            self._quiesce_config_num = -1
+            self._quiesced_instances = set()
+            self._state = Coordinator.S_STARTUP
+        else:
+            # fresh start
+            self._state = Coordinator.S_NORMAL
 
     def _compute_port_epoch(self, addr, port):
         ver = self._portcounters[(addr, port)]
@@ -99,24 +128,40 @@ class Coordinator(object):
         return ver
 
     def register_instance(self, addr, inport, outport, pid, token):
-        instid = self._instances_by_addr.get((addr, inport, outport, pid, token), 0)
-        if instid != 0:
-            return self._instances_by_id[instid].bindings()
+        # create new instance
         inver = self._compute_port_epoch(addr, inport)
         outver = self._compute_port_epoch(addr, outport)
         inst = hdtypes.Instance(addr, inport, inver, outport, outver, pid, token)
-        inst.add_config(self._config_counter, self._config_data)
-        instid = self._instance_counter
-        self._instance_counter += 1
-        self._instances_by_id[instid] = inst
-        self._instances_by_bindings[inst.bindings()] = instid
-        self._instances_by_addr[(addr, inport, outport, pid, token)] = instid
+        # do not send config before go-live
+        if self._state != Coordinator.S_STARTUP:
+            inst.add_config(self._config_counter, self._config_data)
+        # have we seen this instance before? 
+        instid = self._instances_by_token.get(token, 0)
+        if instid != 0:
+            # host restat or reconnect - replace old instance with the new one
+            # XXX should we do something different on reconnect only?
+            # XXX preserve last_acked and last_rejected?
+            oldinst = self._instances_by_id[instid]
+            del self._instances_by_bindings[oldinst.bindings()]
+            self._instances_by_bindings[inst.bindings()] = instid
+            self._instances_by_id[instid] = inst
+        else:
+            # new instance
+            instid = self._instance_counter
+            self._instance_counter += 1
+            self._instances_by_id[instid] = inst
+            self._instances_by_bindings[inst.bindings()] = instid
+            self._instances_by_token[token] = instid
         return inst.bindings()
 
     def keepalive_instance(self, bindings):
         pass
 
     def add_space(self, space):
+        if self._state != Coordinator.S_NORMAL:
+            raise Coordinator.InvalidState()
+        if not self._service_level_met():
+            raise Coordinator.ServiceLevelNotMet()
         if space.name in self._spaces_by_name:
             raise Coordinator.DuplicateSpace()
         spaceid = None
@@ -135,12 +180,91 @@ class Coordinator(object):
         self._regenerate()
 
     def del_space(self, space):
+        if self._state != Coordinator.S_NORMAL:
+            raise Coordinator.InvalidState()
+        if not self._service_level_met():
+            raise Coordinator.ServiceLevelNotMet()
         if space not in self._spaces_by_name:
             raise Coordinator.UnknownSpace()
         spacenum = self._spaces_by_name[space]
         del self._spaces_by_name[space]
         del self._spaces_by_id[spacenum]
         self._regenerate()
+        
+    def lst_spaces(self):
+        return self._spaces_by_name.keys()
+        
+    def get_space(self, space):
+        if space not in self._spaces_by_name:
+            raise Coordinator.UnknownSpace()
+        spacenum = self._spaces_by_name[space]
+        return self._spaces_by_id[spacenum]
+
+    def quiesce(self):
+        if self._state != Coordinator.S_NORMAL:
+            raise Coordinator.InvalidState()
+        # ask all hosts to save state under unique state id
+        self._quiesced_instances = set()
+        self._quiesce_state_id =  binascii.hexlify(os.urandom(16))
+        self._state = Coordinator.S_QUIESCE
+        logging.info('Cluster is quiescing under state id {0}.'.format(self._quiesce_state_id))
+        self._regenerate()
+        # remember current config num, so we can check if hosts ACKd quiesce
+        self._quiesce_config_num = self._config_counter
+        return self._quiesce_state_id
+
+    def shutdown(self):
+        if self._state != Coordinator.S_QUIESCE:
+            raise Coordinator.InvalidState()
+        # check if all not failed hosts quiesced
+        w = 0
+        for instid, inst in self._instances_by_id.iteritems():
+            if instid not in self._failed_instances:
+                # node must ACK quiesce config and report quiesced message
+                if inst.last_acked < self._quiesce_config_num or instid not in self._quiesced_instances:
+                    w += 1
+        if w:
+            raise Coordinator.InvalidState("Cannot shutdown yet, waiting for {0} hosts to quiesce.".format(w))
+        # send shutdown config to all hosts 
+        self._state = Coordinator.S_SHUTDOWN
+        logging.info('Requesting all nodes to shut down.')
+        self._regenerate()
+        # not waiting for ack, return state
+        return self._dump_state()
+        
+    def get_status(self):
+        # hand picked status for human/client consumption
+        s = {}
+        s['instance_counter'] = self._instance_counter
+        s['instances'] = self._instances_by_id
+        s['failed_instances'] = list(self._failed_instances)
+        s['space_counter'] = self._space_counter
+        s['spaces'] = self._spaces_by_id
+        s['config_counter'] = self._config_counter
+        s['config_data'] = self._config_data
+        s['xfer_counter'] = self._xfer_counter
+        s['xfers'] = self._xfers_by_id
+        s['state'] = self._state
+        s['quiesce_state_id'] = self._quiesce_state_id
+        s['quiesced_instances'] = list(self._quiesced_instances)
+        s['service_level'] = self._service_level()
+        s['service_level_met'] = self._service_level_met()
+        return s
+
+    def go_live(self):
+        if self._state != Coordinator.S_STARTUP:
+            raise Coordinator.InvalidState()
+        # TODO:
+        # - check we have enough nodes joined back, fail with InvalidState() if not yet
+        # - send config with state_id to be restored to all hosts
+        # - fail the nodes that have not replied on time
+        self._state = Coordinator.S_NORMAL
+        logging.info('Pushing config to all hosts.')
+        self._regenerate()
+        logging.info('Cluster is now fully operational.')
+
+    def backup_state(self):
+        return self._dump_state()
 
     def _compute_transfer_id(self, spaceid, subspaceid, regionid):
         xferid = None
@@ -229,6 +353,13 @@ class Coordinator(object):
         del self._xfers_by_id[xferid]
         self._regenerate()
 
+    def quiesced(self, bindings, quiesce_state_id):
+        # ignore quiesced message from previous quiesce
+        if quiesce_state_id != self._quiesce_state_id:
+            return
+        instid = self._instances_by_bindings[bindings]
+        self._quiesced_instances.add(instid)
+
     def _initial_layout(self, space):
         still_assigning = True
         while still_assigning:
@@ -298,6 +429,12 @@ class Coordinator(object):
                                           mask=hex(region.mask).rstrip('L'),
                                           instid=str(instid))
                         used_hosts.add(instid)
+        # quiesce request
+        if (self._state == Coordinator.S_QUIESCE):
+            config += QUIESCE_LINE.format(state_id = self._quiesce_state_id)
+        # shutdown request
+        if (self._state == Coordinator.S_SHUTDOWN):
+            config += SHUTDOWN_LINE
         host_lines = []
         for hostid in sorted(used_hosts):
             inst = self._instances_by_id[hostid]
@@ -307,9 +444,68 @@ class Coordinator(object):
                                 outver=inst.outver)
             host_lines.append(host_line)
         self._config_data = ('\n'.join(host_lines) + '\n' + config).strip()
-        for instid, inst in self._instances_by_id.iteritems():
-            inst.add_config(self._config_counter, self._config_data)
+        # do not send config before go-live
+        if self._state != Coordinator.S_STARTUP:
+            for instid, inst in self._instances_by_id.iteritems():
+                inst.add_config(self._config_counter, self._config_data)
         # XXX notify threads to poll for new configs
+        
+    def _service_level(self):
+        sl = Coordinator.SL_DESIRED
+        for space in self._spaces_by_id.values():
+            for subspace in space.subspaces:
+                for region in subspace.regions:
+                    if region.current_f < 0:
+                        # no need to search more, it is bad
+                        return Coordinator.SL_DATALOSS
+                    if region.current_f < region.desired_f:
+                        # continue search, some region could be worse
+                        sl = Coordinator.SL_DEGRADED
+        return sl
+
+    def _service_level_met(self):
+        return self._service_level() != Coordinator.SL_DATALOSS
+
+    def _dump_state(self):
+        e = hdjson.Encoder()
+        s = {}
+        for attr, value in self.__dict__.iteritems():
+            # dict. with non-string keys must be normalized for JSON encoding
+            if attr in [ "_portcounters", "_instances_by_bindings" ]:
+                s[attr] = e.normalizeDictKeys(value, hdjson.KEYS_TUPLE)
+            elif attr in [ "_instances_by_id", "_spaces_by_id", "_xfers_by_id" ]:
+                s[attr] = e.normalizeDictKeys(value, hdjson.KEYS_INT)
+            else:
+                s[attr] = value
+        s['state_version'] = Coordinator.STATE_VERSION
+        return hdjson.Encoder(**hdjson.HumanReadable).encode(s)
+        
+    def _load_state(self, state):
+        d = hdjson.Decoder()
+        try:
+            s = d.decode(state)
+        except ValueError as e:
+            logging.error("Error decoding given state information".format(e))
+            raise Coordinator.InvalidStateData()
+        if not s.has_key('state_version'):
+            logging.error("Invalid state data used (corrupted or invalid)")
+            raise Coordinator.InvalidStateData()
+        if s['state_version'] != Coordinator.STATE_VERSION:
+            logging.error("Invalid state data used (incompatible version)")
+            raise Coordinator.InvalidStateData()
+        for attr, value in s.iteritems():
+            # dict. with non-string keys must be manually denormalized from JSON encoding
+            if attr in [ "_instances_by_bindings" ]:
+                setattr(self, attr, d.denormalizeDictKeys(value, hdjson.KEYS_TUPLE))
+            elif attr in [ "_instances_by_id", "_spaces_by_id", "_xfers_by_id" ]:
+                setattr(self, attr, d.denormalizeDictKeys(value, hdjson.KEYS_INT))
+            # default dict must be manually created
+            elif attr == "_portcounters":
+                v = d.denormalizeDictKeys(value, hdjson.KEYS_TUPLE)
+                setattr(self, attr, collections.defaultdict(lambda: 1, v))
+            else:
+                setattr(self, attr, value)
+        logging.info('State from shutdown {0} restored'.format(self._quiesce_state_id))
 
 
 class HostConnection(object):
@@ -323,7 +519,7 @@ class HostConnection(object):
         self._identified = None
         self._instance = None # Must be None unless self._identified is INSTANCE
         self._has_config_pending = False
-        self._pending_config_num = 0
+        self._pending_config_num = -1
         self._id = 'Unidentified({0}, {1})'.format(self._sock.getpeername()[0], self._sock.getpeername()[1])
         logging.info('new host uses ID ' + self._id)
 
@@ -360,6 +556,9 @@ class HostConnection(object):
             elif len(commandline) == 2 and commandline[0] == 'transfer_complete':
                 self.transfer_complete(commandline[1])
                 logging.debug("transfer complete {0}".format(commandline[1]))
+            elif len(commandline) == 2 and commandline[0] == 'quiesced':
+                self.quiesced(commandline[1])
+                logging.debug("quiesced {0}".format(commandline[1]))
             else:
                 raise KillConnection('unrecognized command "{0}"'.format(repr(data)))
 
@@ -438,6 +637,9 @@ class HostConnection(object):
             raise KillConnection("host uses non-numeric transfer id for transfer_complete")
         self._coordinator.transfer_complete(xferid)
 
+    def quiesced(self, quiesce_state_id):
+        self._coordinator.quiesced(self._instance, quiesce_state_id)
+
     def send_config(self, num, data):
         self._has_config_pending = True
         self.outgoing += (data + '\nend of line').strip() + '\n'
@@ -459,8 +661,7 @@ class ControlConnection(object):
         self._ibuffer = ''
         self.outgoing = ''
         self._delim = '\n'
-        self._mode = "COMMAND"
-        self._action = None
+        self._currreq = None
         self._identified = 'CONTROL'
         self._id = str(self._sock.getpeername())
         self._conns = conns
@@ -472,25 +673,44 @@ class ControlConnection(object):
         self._ibuffer += data
         while self._delim in self._ibuffer:
             data, self._ibuffer = self._ibuffer.split(self._delim, 1)
-            if self._mode == 'COMMAND':
-                commandline = shlex.split(data)
-                if len(commandline) == 2 and commandline == ['add', 'space']:
-                    self._delim = '\n.\n'
-                    self._mode = 'DATA'
-                    self._action = self.add_space
-                elif len(commandline) == 3 and commandline[:2] == ['del', 'space']:
-                    self.del_space(commandline[2])
-            elif self._mode == 'DATA':
-                self._action(data)
-                self._delim = '\n'
-                self._mode = 'COMMAND'
-            else:
-                raise KillConnection('Control connection with unknown mode {0}'.format(repr(self._mode)))
-
+            try:
+                req = json.loads(data)
+            except ValueError as e:
+                raise KillConnection("Control connection got non-JSON message {0}".format(data))
+            if type(req) != dict:
+                raise KillConnection("Control connection got invalid JSON message {0}".format(data))
+            for r, rv in req.items():
+                self._currreq = r
+                if r == 'add-space':
+                    self.add_space(rv)
+                elif r == 'del-space':
+                    self.del_space(rv)
+                elif r == 'lst-spaces':
+                    self.lst_spaces()
+                elif r == 'get-space':
+                    self.get_space(rv)
+                elif r == 'quiesce':
+                    self.quiesce()
+                elif r == 'shutdown':
+                    self.shutdown()
+                elif r == 'get-status':
+                    self.get_status()
+                elif r == 'go-live':
+                    self.go_live()
+                elif r == 'backup-state':
+                    self.backup_state()
+                else:
+                    raise KillConnection("Control connection got invalid request {0}".format(r))
+                    
     def handle_out(self):
         data = self.outgoing[:PIPE_BUF]
         sz = self._sock.send(data)
         self.outgoing = self.outgoing[sz:]
+
+    def get_status(self):
+        status = self._coordinator.get_status()
+        s = hdjson.Encoder(**hdjson.HumanReadable).encode(status)
+        self.outgoing += json.dumps({self._currreq:s}) + '\n'
 
     def add_space(self, data):
         try:
@@ -503,7 +723,11 @@ class ControlConnection(object):
             return self._fail(str(e))
         except Coordinator.DuplicateSpace as e:
             return self._fail("Space already exists")
-        self.outgoing += 'SUCCESS\n'
+        except Coordinator.InvalidState as e:
+            return self._fail("Coordinator state does not allow handling this request")
+        except Coordinator.ServiceLevelNotMet as e:
+            return self._fail("Service level must be met before adding spaces (need more daemons)")
+        self.outgoing += json.dumps({self._currreq:'SUCCESS'}) + '\n'
         logging.info("created new space \"{0}\"".format(space.name))
 
     def del_space(self, space):
@@ -513,18 +737,62 @@ class ControlConnection(object):
             return self._fail(str(e))
         except Coordinator.UnknownSpace as e:
             return self._fail("Space does not exist")
-        self.outgoing += 'SUCCESS\n'
+        except Coordinator.InvalidState as e:
+            return self._fail("Coordinator state does not allow handling this request")
+        except Coordinator.ServiceLevelNotMet as e:
+            return self._fail("Service level must be met before deleting spaces (need more daemons)")
+        self.outgoing += json.dumps({self._currreq:'SUCCESS'}) + '\n'
         logging.info("removed space \"{0}\"".format(space))
+
+    def lst_spaces(self):
+        spaces = '\n'.join([s for s in self._coordinator.lst_spaces()])
+        self.outgoing += json.dumps({self._currreq:spaces}) + '\n'
+
+    def get_space(self, space):
+        try:
+            space = self._coordinator.get_space(space)
+        except ValueError as e:
+            return self._fail(str(e))
+        except Coordinator.UnknownSpace as e:
+            return self._fail("Space does not exist")
+        s = hdjson.Encoder(**hdjson.HumanReadable).encode(space)
+        self.outgoing += json.dumps({self._currreq:s}) + '\n'
+
+    def quiesce(self):
+        try:
+            state_id = self._coordinator.quiesce()
+        except Coordinator.InvalidState as e:
+            return self._fail("Coordinator state does not allow handling this request")
+        self.outgoing += json.dumps({self._currreq:state_id}) + '\n'
+        logging.info("quiesce request processed")
+
+    def shutdown(self):
+        try:
+            state = self._coordinator.shutdown()
+        except Coordinator.InvalidState as e:
+            return self._fail("Coordinator state does not allow handling this request")
+        self.outgoing += json.dumps({self._currreq:state}) + '\n'
+        logging.info("shutdown request processed")
+
+    def go_live(self):
+        try:
+            self._coordinator.go_live()
+        except Coordinator.InvalidState as e:
+            return self._fail("Coordinator state does not allow handling this request")
+        except Coordinator.ServiceLevelNotMet as e:
+            return self._fail("Service level must be met before go live (need more daemons)")
+        self.outgoing += json.dumps({self._currreq:'SUCCESS'}) + '\n'
+        logging.info("go live request processed")
 
     def _fail(self, msg):
         error = 'failing control connection {0}: {1}'.format(self._id, msg)
+        self.outgoing += json.dumps({self._currreq:'ERROR', 'error':msg}) + '\n'
         logging.error(error)
-        self.outgoing += msg + '\n'
 
-
+        
 class CoordinatorServer(object):
 
-    def __init__(self, bindto, control_port, host_port):
+    def __init__(self, bindto, control_port, host_port, state_data=None):
         self._control_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
         self._control_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._control_listen.bind((bindto, control_port))
@@ -537,7 +805,7 @@ class CoordinatorServer(object):
         self._p.register(self._host_listen)
         self._p.register(self._control_listen)
         self._conns = {}
-        self._coord = Coordinator()
+        self._coord = Coordinator(state_data)
 
     def run(self):
         instances_to_fds = {}
@@ -561,18 +829,18 @@ class CoordinatorServer(object):
                     sock, conn = self._conns[fd]
                     remove = False
                     try:
+                        if ev & select.POLLIN:
+                            conn.handle_in()
+                        if ev & select.POLLOUT:
+                            conn.handle_out()
+                            if conn.outgoing == '':
+                                self._p.modify(fd, select.POLLIN)
                         if ev & select.POLLERR:
                             remove = True
                         elif ev & select.POLLHUP:
                             remove = True
                         elif ev & select.POLLNVAL:
                             remove = True
-                        if not remove and ev & select.POLLIN:
-                            conn.handle_in()
-                        if not remove and ev & select.POLLOUT:
-                            conn.handle_out()
-                            if conn.outgoing == '':
-                                self._p.modify(fd, select.POLLIN)
                     except KillConnection as kc:
                         logging.error('connection killed: ' + str(kc))
                         remove = True
@@ -626,6 +894,7 @@ def main(argv):
     parser.add_argument('-l', '--logging', default='info',
             choices=['debug', 'info', 'warn', 'error', 'critical',
                      'DEBUG', 'INFO', 'WARN', 'ERROR', 'CRITICAL'])
+    parser.add_argument('-s', '--state-file', default='')
     args = parser.parse_args(argv)
     level = {'debug': logging.DEBUG
             ,'info': logging.INFO
@@ -635,10 +904,16 @@ def main(argv):
             }.get(args.logging.lower(), None)
     try:
         logging.basicConfig(level=level)
-        cs = CoordinatorServer(args.bindto, args.control_port, args.host_port)
+        state_data = open(args.state_file, 'r').read() if args.state_file else ""
+        cs = CoordinatorServer(args.bindto, args.control_port, args.host_port, state_data)
+        logging.info('Coordinator started')
         cs.run()
+    except Coordinator.InvalidStateData as ise:
+        logging.error("Error loading state from file {0}".format(args.state_file))
     except socket.error as se:
         logging.error("%s [%d]" % (se.strerror, se.errno))
+    except IOError as ioe:
+        logging.error("%s [%d]" % (ioe.strerror, ioe.errno))
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv[1:]))

@@ -36,7 +36,7 @@ Finally, we create a space which makes use of all three systems in the cluster:
 
    $ hyperdex-coordinator-control --host 127.0.0.1 --port 6970 add-space << EOF
    space phonebook
-   dimensions username, first, last, phone (uint64)
+   dimensions username, first, last, phone (int64)
    key username auto 0 3
    subspace first, last, phone auto 0 3
    EOF
@@ -72,7 +72,7 @@ is:
 
 This enables the application to continue doing other work while HyperDex
 performs the requested operations.  Here's how we could insert the
-"jsmith" user asynchronously:
+"jsmith1" user asynchronously:
 
 .. sourcecode:: pycon
 
@@ -171,7 +171,7 @@ has changed the phone number since it was last read:
 
    >>> c.get('phonebook', 'jsmith1')
    {'first': 'John', 'last': 'Smith', 'phone': 6075551024}
-   >>> c.condput('phonebook', 'jsmith',
+   >>> c.condput('phonebook', 'jsmith1',
    ...           {'phone': 6075551024}, {'phone': 6075552048})
    True
    >>> c.get('phonebook', 'jsmith1')
@@ -188,7 +188,7 @@ specified values. Let's try issuing the same operation again.
 
 .. sourcecode:: pycon
 
-   >>> c.condput('phonebook', 'jsmith',
+   >>> c.condput('phonebook', 'jsmith1',
    ...           {'phone': 6075551024}, {'phone': 6075552048})
    False
 
@@ -203,7 +203,7 @@ key "jsmith" to "James" if the phone number has not changed:
 
 .. sourcecode:: pycon
 
-   >>> c.condput('phonebook', 'jsmith',
+   >>> c.condput('phonebook', 'jsmith1',
    ...           {'phone': 6075552048}, {'first': 'James'})
    True
 
@@ -222,11 +222,11 @@ increments his phone number by 1.  We could accomplish this with the following:
 
 .. sourcecode:: pycon
 
-   >>> c.atomicinc('phonebook', 'jsmith1', {'phone': 1})
+   >>> c.atomic_add('phonebook', 'jsmith1', {'phone': 1})
    True
    >>> c.get('phonebook', 'jsmith1')
    {'first': 'John', 'last': 'Smith', 'phone': 6075552049}
-   >>> c.atomicdec('phonebook', 'jsmith1', {'phone': 1})
+   >>> c.atomic_sub('phonebook', 'jsmith1', {'phone': 1})
    True
    >>> c.get('phonebook', 'jsmith1')
    {'first': 'John', 'last': 'Smith', 'phone': 6075552048}
@@ -237,11 +237,11 @@ We can increment or decrement by any signed 64-bit value:
 
 .. sourcecode:: pycon
 
-   >>> c.atomicinc('phonebook', 'jsmith1', {'phone': 10})
+   >>> c.atomic_add('phonebook', 'jsmith1', {'phone': 10})
    True
    >>> c.get('phonebook', 'jsmith1')
    {'first': 'John', 'last': 'Smith', 'phone': 6075552058}
-   >>> c.atomicdec('phonebook', 'jsmith1', {'phone': 10})
+   >>> c.atomic_sub('phonebook', 'jsmith1', {'phone': 10})
    True
    >>> c.get('phonebook', 'jsmith1')
    {'first': 'John', 'last': 'Smith', 'phone': 6075552048}

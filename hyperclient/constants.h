@@ -1,4 +1,4 @@
-// Copyright (c) 2012, Cornell University
+// Copyright (c) 2011-2012, Cornell University
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -25,18 +25,15 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-#ifndef hyperdex_datatype_h_
-#define hyperdex_datatype_h_
+#ifndef hyperclient_constants_h_
+#define hyperclient_constants_h_
 
-namespace hyperdex
-{
+// BusyBee
+#include <busybee_constants.h>
 
-enum datatype
-{
-    DATATYPE_STRING,
-    DATATYPE_INT64
-};
+#define HYPERCLIENT_HEADER_SIZE (BUSYBEE_HEADER_SIZE + sizeof(uint64_t) \
+                                + sizeof(uint8_t) + 2 * sizeof(uint16_t) \
+                                + 2 * hyperdex::entityid::SERIALIZEDSIZE \
+                                + sizeof(uint64_t))
 
-} // namespace hyperdex
-
-#endif // hyperdex_datatype_h_
+#endif // hyperclient_constants_h_
