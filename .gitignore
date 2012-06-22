@@ -71,6 +71,7 @@ hyperclient/python/hyperclient.la
 hyperclient/python/hyperclient_python_hyperclient_la-hyperclient.lo
 hyperclient/python/hyperclient_python_hyperclient_la-hyperclient.o
 hyperclient-ycsb-0.1.dev.jar
+hypercoordinator/concoordify.pyc
 hypercoordinator/coordinator.pyc
 hypercoordinator/hdjson.pyc
 hypercoordinator/hdtypes.pyc

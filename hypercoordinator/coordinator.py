@@ -42,6 +42,7 @@ import os
 
 import pyparsing
 
+import hypercoordinator.concoordify
 import hypercoordinator.parser
 from hypercoordinator import hdtypes
 
@@ -792,7 +793,7 @@ class ControlConnection(object):
         
 class CoordinatorServer(object):
 
-    def __init__(self, bindto, control_port, host_port, state_data=None):
+    def __init__(self, bindto, control_port, host_port, bootstrap=None, state_data=None):
         self._control_listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
         self._control_listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._control_listen.bind((bindto, control_port))
@@ -805,7 +806,11 @@ class CoordinatorServer(object):
         self._p.register(self._host_listen)
         self._p.register(self._control_listen)
         self._conns = {}
-        self._coord = Coordinator(state_data)
+        if bootstrap is None:
+            self._coord = Coordinator(state_data)
+        else:
+            cc = hypercoordinator.concoordify.concoordify(Coordinator, bootstrap, 'None')
+            self._coord = cc()
 
     def run(self):
         instances_to_fds = {}
@@ -888,6 +893,7 @@ class CoordinatorServer(object):
 def main(argv):
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument('-B', '--bootstrap', default=None)
     parser.add_argument('-b', '--bindto', default='')
     parser.add_argument('-c', '--control-port', type=int, default=0)
     parser.add_argument('-p', '--host-port', type=int, default=0)
@@ -905,7 +911,7 @@ def main(argv):
     try:
         logging.basicConfig(level=level)
         state_data = open(args.state_file, 'r').read() if args.state_file else ""
-        cs = CoordinatorServer(args.bindto, args.control_port, args.host_port, state_data)
+        cs = CoordinatorServer(args.bindto, args.control_port, args.host_port, args.bootstrap, state_data)
         logging.info('Coordinator started')
         cs.run()
     except Coordinator.InvalidStateData as ise:
