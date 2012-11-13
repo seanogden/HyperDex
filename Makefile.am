@@ -59,8 +59,7 @@ noinst_HEADERS = \
 bin_PROGRAMS = \
 			hyperdex-daemon \
 			hyperdex-replication-stress-test \
-			hyperdex-search-stress-test \
-			hyperdex-simple-consistency-stress-test
+			hyperdex-search-stress-test
 
 noinst_PROGRAMS = \
 			$(libhyperspacehashing_noinst_programs) \
@@ -203,8 +202,8 @@ hyperdex_daemon_LDADD = \
 			$(BUSYBEE_LIBS) -lleveldb \
 			-lbusybee-mta \
 			$(COVERAGE_LDADD) \
-			-lcityhash -lpopt -lglog -lrt -lpthread
-hyperdex_daemon_LDFLAGS = -no-install
+			-lcityhash -lpopt -lglog -lpthread
+hyperdex_daemon_LDFLAGS = -no-install -rt
 hyperdex_daemon_CPPFLAGS = \
 			-I$(abs_top_srcdir)/hyperspacehashing \
 			$(E_CFLAGS) \
@@ -414,24 +413,14 @@ hyperdex_search_stress_test_LDADD = \
 			-lpopt
 hyperdex_search_stress_test_LDFLAGS = -no-install
 
-hyperdex_simple_consistency_stress_test_SOURCES = \
-			simple-consistency-stress-test.cc
-hyperdex_simple_consistency_stress_test_CPPFLAGS = \
-			-I$(abs_top_srcdir)/hyperclient \
-			$(E_CFLAGS) \
-			$(CPPFLAGS)
-hyperdex_simple_consistency_stress_test_LDADD = \
-			libhyperclient.la \
-			-lpopt -lpthread
-
 if ENABLE_TRACEPLAYER
 bin_PROGRAMS += hyperdex-trace-player
 hyperdex_trace_player_SOURCES = \
 			trace-player.cc
 hyperdex_trace_player_LDADD = \
 			libhyperclient.la \
-			-lbsd \
-			-lrt
+			-lbsd 
+hyperdex_trace_player_LDFLAGS = -rt
 hyperdex_trace_player_CPPFLAGS = \
 			$(E_CFLAGS) \
 			$(CPPFLAGS)

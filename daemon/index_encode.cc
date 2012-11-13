@@ -31,9 +31,14 @@
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <math.h>
 
 // Linux
+#ifdef LINUX
 #include <ieee754.h>
+#else
+#include <port_ieee.h>
+#endif
 
 // C++
 #include <iostream>
@@ -111,7 +116,7 @@ hyperdex :: index_encode_double(double x, char* ptr)
 {
     uint64_t out = 0xffffffffffffffffULL;
 
-    if (isinf(x))
+    if (std::isinf(x))
     {
         if (x > 0)
         {
@@ -122,7 +127,7 @@ hyperdex :: index_encode_double(double x, char* ptr)
             out = 0;
         }
     }
-    else if (isnan(x))
+    else if (std::isnan(x))
     {
         out = 0xfff0000000000000ULL + 3;
     }
