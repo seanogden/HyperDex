@@ -28,6 +28,13 @@
 // POSIX
 #include <signal.h>
 
+#ifdef __APPLE__
+#include <mach/mach_init.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+#endif
+
 // STL
 #include <sstream>
 
@@ -347,12 +354,23 @@ daemon :: loop(size_t thread)
     sigset_t ss;
 
     size_t core = thread % sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef __APPLE__ 
+    struct thread_affinity_policy ap;
+    ap.affinity_tag = core;
+    int x = thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                      THREAD_AFFINITY_POLICY,
+                      &ap.affinity_tag,
+                      THREAD_AFFINITY_POLICY_COUNT
+                      );
+    assert(x == 0);
+#else
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core, &cpuset);
     pthread_t cur = pthread_self();
     int x = pthread_setaffinity_np(cur, sizeof(cpu_set_t), &cpuset);
     assert(x == 0);
+#endif
 
     LOG(INFO) << "network thread " << thread << " started on core " << core;
 
